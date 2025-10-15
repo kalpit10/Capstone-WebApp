@@ -1,0 +1,41 @@
+version: "3.9"
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: capstone-webapp-backend
+    ports:
+      - "5000:5000"
+    env_file:
+      - .env
+    networks:
+      - capstone-network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: capstone-webapp-frontend
+    depends_on:
+      - backend
+    networks:
+      - capstone-network
+
+  nginx:
+    build:
+      context: .
+      dockerfile: nginx/Dockerfile
+    container_name: capstone-nginx
+    ports:
+      - "3000:80"
+    depends_on:
+      - frontend
+      - backend
+    networks:
+      - capstone-network
+
+networks:
+  capstone-network:
+    driver: bridge
