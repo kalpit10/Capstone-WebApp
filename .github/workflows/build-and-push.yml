@@ -43,7 +43,7 @@ jobs:
           IMAGE_URI="${{ steps.login-ecr.outputs.registry }}/${REPO_NAME}:${{ env.IMAGE_TAG }}"
           echo "Building and pushing $IMAGE_URI"
 
-          docker build -t $IMAGE_URI ./ ${{ matrix.service }}
+          docker build -t $IMAGE_URI ${{ matrix.service }}/
           docker push $IMAGE_URI
 
       - name: Logout from Amazon ECR
