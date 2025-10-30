@@ -41,14 +41,16 @@ jobs:
         run: |
           REPO_NAME=${{ env.ECR_REPO_PREFIX }}-${{ matrix.service }}
           IMAGE_URI="${{ steps.login-ecr.outputs.registry }}/${REPO_NAME}:${{ env.IMAGE_TAG }}"
-          echo "Building and pushing $IMAGE_URI"
+          LATEST_URI="${{ steps.login-ecr.outputs.registry }}/${REPO_NAME}:latest"
+          echo "Building and pushing $IMAGE_URI and $LATEST_URI"
 
           if [ "${{ matrix.service }}" = "backend" ]; then
-          docker build -t $IMAGE_URI -f backend/Dockerfile . 
+            docker build -t $IMAGE_URI -t $LATEST_URI -f backend/Dockerfile . 
           else
-          docker build -t $IMAGE_URI ${{ matrix.service }}/
+            docker build -t $IMAGE_URI -t $LATEST_URI ${{ matrix.service }}/
           fi
           docker push $IMAGE_URI
+          docker push $LATEST_URI
 
       - name: Logout from Amazon ECR
         if: always()
