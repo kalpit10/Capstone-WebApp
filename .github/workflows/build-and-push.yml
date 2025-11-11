@@ -1,57 +1,106 @@
 name: Build and Push Docker Images to ECR
 
+# This pipeline will run every time code changes in the main branch
 on:
   push:
     branches: ["main"]
   pull_request:
     branches: ["main"]
 
+# These permissions are needed for GitHub OIDC to work with AWS
 permissions:
-  id-token: write # Required for OIDC
-  contents: read # Required for actions/checkout
+  id-token: write   # so GitHub can request a temporary AWS token
+  contents: read    # to allow actions/checkout to read my code
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
 
     strategy:
+      # I am using matrix so I can build all three services in parallel
       matrix:
         service: [frontend, backend, nginx]
 
     env:
+      # Region and IAM role are stored safely as GitHub secrets
       AWS_REGION: ${{ secrets.AWS_REGION }}
+      AWS_ROLE_TO_ASSUME: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+
+      # This is a common prefix for all my repositories
       ECR_REPO_PREFIX: capstone-proshop
+
+      # Tagging images with commit SHA for traceability
       IMAGE_TAG: ${{ github.sha }}
 
     steps:
+      # Step 1: Checkout the repository code into the runner
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # Step 2: Configure AWS credentials using OIDC (no static keys)
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          role-to-assume: ${{ env.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
 
+      # Step 3: Log in to Amazon ECR and get a registry URI for later
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build, tag, and push image
+      # Step 4: Build, tag, and push Docker images to whichever ECR repos exist
+      - name: Build, tag, and push to all available ECR repos
         run: |
-          REPO_NAME=${{ env.ECR_REPO_PREFIX }}-${{ matrix.service }}
-          IMAGE_URI="${{ steps.login-ecr.outputs.registry }}/${REPO_NAME}:${{ env.IMAGE_TAG }}"
-          LATEST_URI="${{ steps.login-ecr.outputs.registry }}/${REPO_NAME}:latest"
-          echo "Building and pushing $IMAGE_URI and $LATEST_URI"
+          # Build base names
+          BASE_REPO=${{ env.ECR_REPO_PREFIX }}-${{ matrix.service }}
+          REPO_DEV="${BASE_REPO}"
+          REPO_PROD="${BASE_REPO}-prod"
 
+          # Full URIs with SHA tag
+          IMAGE_URI_DEV="${{ steps.login-ecr.outputs.registry }}/${REPO_DEV}:${{ env.IMAGE_TAG }}"
+          IMAGE_URI_PROD="${{ steps.login-ecr.outputs.registry }}/${REPO_PROD}:${{ env.IMAGE_TAG }}"
+
+          # Also add 'latest' tags for convenience
+          IMAGE_URI_DEV_LATEST="${{ steps.login-ecr.outputs.registry }}/${REPO_DEV}:latest"
+          IMAGE_URI_PROD_LATEST="${{ steps.login-ecr.outputs.registry }}/${REPO_PROD}:latest"
+
+          echo "Building image for service: $BASE_REPO"
+          echo "Image tags: $IMAGE_URI_DEV and $IMAGE_URI_PROD"
+
+          # Build Docker image (backend Dockerfile is in root, others in subfolders)
           if [ "${{ matrix.service }}" = "backend" ]; then
-            docker build -t $IMAGE_URI -t $LATEST_URI -f backend/Dockerfile . 
+            docker build -t $IMAGE_URI_DEV -t $IMAGE_URI_DEV_LATEST -t $IMAGE_URI_PROD -t $IMAGE_URI_PROD_LATEST -f backend/Dockerfile .
           else
-            docker build -t $IMAGE_URI -t $LATEST_URI ${{ matrix.service }}/
+            docker build -t $IMAGE_URI_DEV -t $IMAGE_URI_DEV_LATEST -t $IMAGE_URI_PROD -t $IMAGE_URI_PROD_LATEST ${{ matrix.service }}/
           fi
-          docker push $IMAGE_URI
-          docker push $LATEST_URI
 
+          echo "Checking which ECR repositories exist..."
+          # Check if dev and prod repositories are available
+          aws ecr describe-repositories --repository-names "$REPO_DEV" >/dev/null 2>&1 && DEV_EXISTS=true || DEV_EXISTS=false
+          aws ecr describe-repositories --repository-names "$REPO_PROD" >/dev/null 2>&1 && PROD_EXISTS=true || PROD_EXISTS=false
+
+          echo "DEV_EXISTS=$DEV_EXISTS | PROD_EXISTS=$PROD_EXISTS"
+
+          # Push to DEV repository if available
+          if [ "$DEV_EXISTS" = true ]; then
+            echo "Pushing to DEV: $IMAGE_URI_DEV and $IMAGE_URI_DEV_LATEST"
+            docker push $IMAGE_URI_DEV
+            docker push $IMAGE_URI_DEV_LATEST
+          else
+            echo "DEV repository not found, skipping DEV push."
+          fi
+
+          # Push to PROD repository if available
+          if [ "$PROD_EXISTS" = true ]; then
+            echo "Pushing to PROD: $IMAGE_URI_PROD and $IMAGE_URI_PROD_LATEST"
+            docker push $IMAGE_URI_PROD
+            docker push $IMAGE_URI_PROD_LATEST
+          else
+            echo "PROD repository not found, skipping PROD push."
+          fi
+
+      # Step 5: I always log out from Docker to clean up credentials
       - name: Logout from Amazon ECR
         if: always()
         run: docker logout ${{ steps.login-ecr.outputs.registry }}
