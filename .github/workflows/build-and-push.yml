@@ -19,7 +19,7 @@ jobs:
     strategy:
       # I am using matrix so I can build all three services in parallel
       matrix:
-        service: [frontend, backend, nginx]
+        service: [frontend, backend]
 
     env:
       # Region and IAM role are stored safely as GitHub secrets
@@ -27,7 +27,7 @@ jobs:
       AWS_ROLE_TO_ASSUME: ${{ secrets.AWS_ROLE_TO_ASSUME }}
 
       # This is a common prefix for all my repositories
-      ECR_REPO_PREFIX: capstone-proshop
+      ECR_REPO_PREFIX: proshop
 
       # Tagging images with commit SHA for traceability
       IMAGE_TAG: ${{ github.sha }}
