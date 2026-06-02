@@ -1,106 +1,314 @@
 name: Build and Push Docker Images to ECR
 
-# This pipeline will run every time code changes in the main branch
+# ─── TRIGGERS ────────────────────────────────────────────────────────────────
+# workflow_dispatch: primary trigger. Called manually or by the infra pipeline
+#   via the GitHub API after terraform apply completes.
 on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment (dev or prod)"
+        required: true
+        default: "dev"
+        type: choice
+        options:
+          - dev
+          - prod
+# push to main: secondary trigger for when application code actually changes.
   push:
     branches: ["main"]
+# pull_request to main: CI-only. Builds and scans images but NEVER pushes.
   pull_request:
     branches: ["main"]
 
-# These permissions are needed for GitHub OIDC to work with AWS
+# ─── PERMISSIONS ─────────────────────────────────────────────────────────────
+# id-token: write   → allows GitHub to mint an OIDC token for AWS auth
+# contents: read    → allows actions/checkout to read the repo
+# security-events: write → allows Trivy to upload SARIF to GitHub Security tab
 permissions:
-  id-token: write   # so GitHub can request a temporary AWS token
-  contents: read    # to allow actions/checkout to read my code
+  id-token: write
+  contents: read
+  security-events: write
 
+# ─── JOBS ────────────────────────────────────────────────────────────────────
 jobs:
-  build-and-push:
+  build-scan-push:
+    name: Build / Scan / Push (${{ matrix.service }})
     runs-on: ubuntu-latest
 
     strategy:
-      # I am using matrix so I can build all three services in parallel
+      # fail-fast: false means if backend fails Trivy, frontend still completes.
+      # We want the full picture of what's broken before deciding whether to push.
+      fail-fast: false
       matrix:
         service: [frontend, backend]
 
     env:
-      # Region and IAM role are stored safely as GitHub secrets
       AWS_REGION: ${{ secrets.AWS_REGION }}
       AWS_ROLE_TO_ASSUME: ${{ secrets.AWS_ROLE_TO_ASSUME }}
-
-      # This is a common prefix for all my repositories
       ECR_REPO_PREFIX: proshop
-
-      # Tagging images with commit SHA for traceability
       IMAGE_TAG: ${{ github.sha }}
 
     steps:
-      # Step 1: Checkout the repository code into the runner
-      - name: Checkout code
-        uses: actions/checkout@v4
+      # ── 1. Checkout ─────────────────────────────────────────────────────────
+      # Pin to 40-char SHA for security.
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        # pin: actions/checkout v4.2.2
 
-      # Step 2: Configure AWS credentials using OIDC (no static keys)
-      - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
+      # ── 2. Configure AWS credentials via OIDC ───────────────────────────────
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
+        # pin: aws-actions/configure-aws-credentials v4.0.2
         with:
           role-to-assume: ${{ env.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # Step 3: Log in to Amazon ECR and get a registry URI for later
+      # ── 3. Login to ECR ─────────────────────────────────────────────────────
       - name: Login to Amazon ECR
         id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
+        uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076
+        # pin: aws-actions/amazon-ecr-login v2.0.1
 
-      # Step 4: Build, tag, and push Docker images to whichever ECR repos exist
-      - name: Build, tag, and push to all available ECR repos
+      # ── 4. Build Docker image ───────────────────────────────────────────────
+      # Build locally first. Trivy scans the local image before any push
+      # decision is made. The image is tagged with the commit SHA for
+      # traceability. Every image in ECR maps to exactly one commit.
+      - name: Build Docker image
+        id: build
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         run: |
-          # Build base names
-          BASE_REPO=${{ env.ECR_REPO_PREFIX }}-${{ matrix.service }}
-          REPO_DEV="${BASE_REPO}"
-          REPO_PROD="${BASE_REPO}-prod"
+          BASE_REPO="${ECR_REPO_PREFIX}-${{ matrix.service }}"
+          LOCAL_IMAGE="local/${BASE_REPO}:${IMAGE_TAG}"
 
-          # Full URIs with SHA tag
-          IMAGE_URI_DEV="${{ steps.login-ecr.outputs.registry }}/${REPO_DEV}:${{ env.IMAGE_TAG }}"
-          IMAGE_URI_PROD="${{ steps.login-ecr.outputs.registry }}/${REPO_PROD}:${{ env.IMAGE_TAG }}"
+          echo "Building: $LOCAL_IMAGE"
 
-          # Also add 'latest' tags for convenience
-          IMAGE_URI_DEV_LATEST="${{ steps.login-ecr.outputs.registry }}/${REPO_DEV}:latest"
-          IMAGE_URI_PROD_LATEST="${{ steps.login-ecr.outputs.registry }}/${REPO_PROD}:latest"
-
-          echo "Building image for service: $BASE_REPO"
-          echo "Image tags: $IMAGE_URI_DEV and $IMAGE_URI_PROD"
-
-          # Build Docker image (backend Dockerfile is in root, others in subfolders)
           if [ "${{ matrix.service }}" = "backend" ]; then
-            docker build -t $IMAGE_URI_DEV -t $IMAGE_URI_DEV_LATEST -t $IMAGE_URI_PROD -t $IMAGE_URI_PROD_LATEST -f backend/Dockerfile .
+            docker build -t "$LOCAL_IMAGE" -f backend/Dockerfile .
           else
-            docker build -t $IMAGE_URI_DEV -t $IMAGE_URI_DEV_LATEST -t $IMAGE_URI_PROD -t $IMAGE_URI_PROD_LATEST ${{ matrix.service }}/
+            docker build -t "$LOCAL_IMAGE" ${{ matrix.service }}/
           fi
 
-          echo "Checking which ECR repositories exist..."
-          # Check if dev and prod repositories are available
-          aws ecr describe-repositories --repository-names "$REPO_DEV" >/dev/null 2>&1 && DEV_EXISTS=true || DEV_EXISTS=false
-          aws ecr describe-repositories --repository-names "$REPO_PROD" >/dev/null 2>&1 && PROD_EXISTS=true || PROD_EXISTS=false
+          # Export for downstream steps
+          echo "local_image=${LOCAL_IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "base_repo=${BASE_REPO}" >> "$GITHUB_OUTPUT"
 
-          echo "DEV_EXISTS=$DEV_EXISTS | PROD_EXISTS=$PROD_EXISTS"
+      # ── 5. Trivy scan ───────────────────────────────────────────────────────
+      # Trivy scans the locally-built image BEFORE any push.
+      # Severity threshold: CRITICAL only.
+      #   HIGH is excluded because base OS packages (e.g. libssl in node:alpine)
+      #   frequently have HIGH-severity CVEs with no available fix upstream.
+      #   Blocking on HIGH creates a gate that always fires → gets bypassed.
+      #   CRITICAL CVEs have known exploits, are actively weaponized, and almost
+      #   always have a patch available. A CRITICAL gate has teeth.
+      #
+      # exit-code: 1 → the step fails hard if CRITICAL CVEs are found.
+      #   The matrix step fails, the push steps below are skipped, the job is
+      #   marked failed, and a SARIF report is uploaded to the Security tab.
+      #
+      # Trivy is pinned to a 40-char commit SHA - the March 2026 Trivy supply
+      # chain attack moved the mutable @v0.x tag to malicious code mid-run.
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@76071ef0d7ec797419534a183b498b4d6366cf37
+        # pin: aquasecurity/trivy-action v0.29.0
+        with:
+          image-ref: ${{ steps.build.outputs.local_image }}
+          # SARIF (Static Analysis Results Interchange Format) is an open, standardized JSON-based format used by Trivy to export its security findings.
+          format: sarif
+          output: trivy-results-${{ matrix.service }}.sarif
+          severity: CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
 
-          # Push to DEV repository if available
-          if [ "$DEV_EXISTS" = true ]; then
-            echo "Pushing to DEV: $IMAGE_URI_DEV and $IMAGE_URI_DEV_LATEST"
-            docker push $IMAGE_URI_DEV
-            docker push $IMAGE_URI_DEV_LATEST
+      
+
+      # ── 6. Upload SARIF to GitHub Security tab ──────────────────────────────
+      # Runs even when Trivy fails so the Security tab always shows findings.
+      # 'if: always()' ensures this step runs regardless of prior step outcome.
+      - name: Upload Trivy SARIF to Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        # Note: codeql-action is maintained by GitHub itself. For this action
+        # specifically, using the SHA of v3.28.x is acceptable; update to SHA
+        # if your security posture requires strict pinning here too.
+        with:
+          sarif_file: trivy-results-${{ matrix.service }}.sarif
+          category: trivy-${{ matrix.service }}
+
+      # ── 7. Determine push intent ─────────────────────────────────────────────
+      # We only push on: push to main, or workflow_dispatch.
+      # PRs: build and scan only. Never push from a PR.
+      - name: Set push flag
+        id: push-flag
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "should_push=false" >> "$GITHUB_OUTPUT"
           else
-            echo "DEV repository not found, skipping DEV push."
+            echo "should_push=true" >> "$GITHUB_OUTPUT"
           fi
 
-          # Push to PROD repository if available
-          if [ "$PROD_EXISTS" = true ]; then
-            echo "Pushing to PROD: $IMAGE_URI_PROD and $IMAGE_URI_PROD_LATEST"
-            docker push $IMAGE_URI_PROD
-            docker push $IMAGE_URI_PROD_LATEST
+      # ── 8. Determine target environment ─────────────────────────────────────
+      # workflow_dispatch: use the user-supplied environment input.
+      # push to main: default to dev (prod requires an explicit dispatch).
+      - name: Set target environment
+        id: target-env
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "env_target=${{ github.event.inputs.environment }}" >> "$GITHUB_OUTPUT"
           else
-            echo "PROD repository not found, skipping PROD push."
+            echo "env_target=dev" >> "$GITHUB_OUTPUT"
+          fi  
+
+      # ── 9. Push to ECR ──────────────────────────────────────────────────────
+      # Only runs if should_push=true (i.e., not a PR).
+      #
+      # Dev:  SHA tag + latest tag
+      #       latest gives ArgoCD and developers a convenient "current" pointer
+      #       in dev where iteration speed matters.
+      # Prod: SHA tag ONLY.
+      #       latest in prod is a footgun — it creates ambiguity about what's
+      #       actually running. Every prod deploy must be traceable to an exact
+      #       commit. If you need to roll back, you reference a SHA, not "latest".
+      - name: Push images to ECR
+        if: steps.push-flag.outputs.should_push == 'true'
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          BASE_REPO="${{ steps.build.outputs.base_repo }}"
+          LOCAL_IMAGE="${{ steps.build.outputs.local_image }}"
+          ENV_TARGET="${{ steps.target-env.outputs.env_target }}"
+
+          if [ "$ENV_TARGET" = "prod" ]; then
+            REMOTE_REPO="${BASE_REPO}-prod"
+          else
+            REMOTE_REPO="${BASE_REPO}"
           fi
 
-      # Step 5: I always log out from Docker to clean up credentials
+          SHA_URI="${REGISTRY}/${REMOTE_REPO}:${IMAGE_TAG}"
+
+          echo "Checking ECR repository: $REMOTE_REPO"
+          aws ecr describe-repositories --repository-names "$REMOTE_REPO" >/dev/null 2>&1 || {
+            echo "ECR repository $REMOTE_REPO not found. Infra may not be deployed yet."
+            exit 1
+          }
+
+          echo "Tagging: $LOCAL_IMAGE → $SHA_URI"
+          docker tag "$LOCAL_IMAGE" "$SHA_URI"
+          docker push "$SHA_URI"
+          echo "Pushed SHA tag: $SHA_URI"
+
+          if [ "$ENV_TARGET" = "dev" ]; then
+            LATEST_URI="${REGISTRY}/${REMOTE_REPO}:latest"
+            docker tag "$LOCAL_IMAGE" "$LATEST_URI"
+            docker push "$LATEST_URI"
+            echo "Pushed latest tag (dev only): $LATEST_URI"
+          fi
+
+          # Export pushed URI for the manifest update job
+          echo "sha_uri=${SHA_URI}" >> "$GITHUB_ENV"
+
+      # ── 10. ECR logout ───────────────────────────────────────────────────────
       - name: Logout from Amazon ECR
         if: always()
         run: docker logout ${{ steps.login-ecr.outputs.registry }}
+
+  # ─── UPDATE MANIFESTS ────────────────────────────────────────────────────────
+  # This job runs after BOTH matrix legs (frontend + backend) complete
+  # successfully. It cannot run in the matrix itself because both services need
+  # to finish before we commit — a partial commit (only frontend tag updated)
+  # would cause ArgoCD to deploy a mismatched pair.
+  update-manifests:
+    name: Update image tags in infra repo
+    runs-on: ubuntu-latest
+    needs: build-scan-push
+    # Only run on actual pushes or dispatches — same logic as push-flag above.
+    if: github.event_name != 'pull_request'
+
+    steps:
+      # ── 1. Checkout INFRA repo ───────────────────────────────────────────────
+      # INFRA_REPO_TOKEN is a fine-grained PAT scoped to:
+      #   - Repository: kalpit10/cloud-native-ecommerce-platform only
+      #   - Permissions: contents:write only
+      - name: Checkout infra repo
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        # pin: actions/checkout v4.2.2
+        with:
+          repository: kalpit10/cloud-native-ecommerce-platform
+          ref: phase1-test
+          token: ${{ secrets.INFRA_REPO_TOKEN }}
+          path: infra-repo
+
+      # ── 2. Update image tags ─────────────────────────────────────────────────
+      # sed targets the exact image line format from the manifests:
+      #   image: <registry>/proshop-{service}:<any-tag> # ...
+      # and replaces the tag portion with the new SHA.
+      #
+      # We use the REGISTRY output from the login step — but since this is a
+      # separate job, we re-derive the registry from the ECR URL pattern using
+      # the AWS account ID (embedded in the image URI from the matrix job).
+      # Alternatively we hardcode the account ID prefix since it's not a secret.
+      - name: Update deployment manifests with SHA tags
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+          # Hardcoding account ID prefix is acceptable — it's not a secret,
+          # it's visible in any ECR URI, Terraform output, or AWS console.
+          ECR_REGISTRY: "395136123952.dkr.ecr.us-east-1.amazonaws.com"
+        run: |
+          cd infra-repo
+
+          # Determine env suffix for ECR repo naming
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && \
+             [ "${{ github.event.inputs.environment }}" = "prod" ]; then
+            BACKEND_REPO="proshop-backend-prod"
+            FRONTEND_REPO="proshop-frontend-prod"
+          else
+            BACKEND_REPO="proshop-backend"
+            FRONTEND_REPO="proshop-frontend"
+          fi
+
+          BACKEND_URI="${ECR_REGISTRY}/${BACKEND_REPO}:${IMAGE_TAG}"
+          FRONTEND_URI="${ECR_REGISTRY}/${FRONTEND_REPO}:${IMAGE_TAG}"
+
+          echo "Updating backend manifest to: $BACKEND_URI"
+          # The sed pattern matches the image line up to and including the colon,
+          # then replaces everything after the colon (the tag) up to the first
+          # space or end-of-line. The trailing comment is preserved.
+          sed -i "s|image: ${ECR_REGISTRY}/proshop-backend[^:]*:[^ ]*|image: ${BACKEND_URI}|" \
+            gitops/proshop/backend-deployment.yaml
+
+          echo "Updating frontend manifest to: $FRONTEND_URI"
+          sed -i "s|image: ${ECR_REGISTRY}/proshop-frontend[^:]*:[^ ]*|image: ${FRONTEND_URI}|" \
+            gitops/proshop/frontend-deployment.yaml
+
+          echo "--- Backend manifest image line after update ---"
+          grep "image:" gitops/proshop/backend-deployment.yaml
+          echo "--- Frontend manifest image line after update ---"
+          grep "image:" gitops/proshop/frontend-deployment.yaml
+
+      # ── 3. Commit and push back to infra repo ───────────────────────────────
+      # git config is set to a bot identity so the commit is clearly automated.
+      # If no files changed (e.g., same SHA ran twice), git diff --quiet exits 0
+      # and we skip the commit — idempotent behavior.
+      - name: Commit and push manifest updates
+        run: |
+          cd infra-repo
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add gitops/proshop/backend-deployment.yaml \
+                  gitops/proshop/frontend-deployment.yaml
+
+          if git diff --cached --quiet; then
+            echo "No manifest changes detected — image tags already up to date."
+            exit 0
+          fi
+
+          git commit -m "ci: update image tags to ${{ github.sha }}
+
+          Automated update from webapp pipeline run ${{ github.run_id }}.
+          Triggered by: ${{ github.event_name }}
+          Environment: ${{ github.event.inputs.environment || 'dev' }}"
+
+          git push origin phase1-test
+          echo "Manifest update committed and pushed to phase1-test."
