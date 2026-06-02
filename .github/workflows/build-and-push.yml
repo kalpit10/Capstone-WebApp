@@ -119,7 +119,7 @@ jobs:
           output: trivy-results-${{ matrix.service }}.sarif
           severity: CRITICAL
           exit-code: "1"
-          ignore-unfixed: true
+          limit-severities-for-sarif: true
 
       
 
